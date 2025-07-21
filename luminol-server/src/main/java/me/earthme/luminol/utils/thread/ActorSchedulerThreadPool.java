@@ -29,11 +29,11 @@ public class ActorSchedulerThreadPool {
     private final AtomicBoolean shutdown = new AtomicBoolean(false);
 
     // TODO Balance them
-    private final long minTaskDeadlineOffset = 1_000_000L; // 1ms
+    private final long minTaskDeadlineOffset = 2_000_000L; // 2ms
     private final long minTickTimeBuffer = 2_000_000L; // 2ms
 
-    private final long maxTaskDeadlineOffset = 2_000_000L; // 2ms
-    private final long maxTickTimeBuffer = 8_000_000L; // 8ms
+    private final long maxTaskDeadlineOffset = 6_000_000L; // 6ms
+    private final long maxTickTimeBuffer = 6_000_000L; // 6ms
 
     private volatile double lastAvgHitPct = 0.5D;
 
