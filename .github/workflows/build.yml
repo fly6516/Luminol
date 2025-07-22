@@ -47,7 +47,7 @@ jobs:
         run: sh scripts/SetENV.sh
 
       - name: Publish to repo
-        if: github.event_name != 'pull_request' && env.flag_release
+        if: github.event_name != 'pull_request' && env.flag_release == 'true'
         continue-on-error: true
         run: ./gradlew --refresh-dependencies generateDevelopmentBundle publish -PpublishDevBundle=true
         env:
@@ -55,7 +55,7 @@ jobs:
           PRIVATE_MAVEN_REPO_USERNAME: ${{ secrets.PRIVATE_MAVEN_REPO_USERNAME }}
 
       - name: Create Release
-        if: github.event_name != 'pull_request' && env.flag_release
+        if: github.event_name != 'pull_request' && env.flag_release == 'true'
         uses: ncipollo/release-action@v1
         with:
           tag: ${{ env.tag }}
