@@ -162,7 +162,7 @@ public class ActorSchedulerThreadPool {
             long tickDeadlineOffset,
             long mainThreadTaskPeriod,
             boolean interruptMainThreadTask,
-            boolean interruptTick
+            boolean pushTickWithinMinTickDeadlineBuffer
     ) {
         final Consumer<WorkerMessageNode> action = node -> {
             target.tickTimeDeadlineBuffer = tickDeadlineOffset;
@@ -176,7 +176,7 @@ public class ActorSchedulerThreadPool {
             // we only do this when we are processed inside a large message block(WorkerMessageNode)
             if (node != null) {
                 target.mainThreadTaskInterrupted = interruptMainThreadTask;
-                target.tickTaskInterrupted = interruptTick;
+                target.pushTickWithinMinTickDeadlineBuffer = pushTickWithinMinTickDeadlineBuffer;
             }
         };
 
@@ -231,7 +231,7 @@ public class ActorSchedulerThreadPool {
                 currToApproach_tickDeadlineOffset,
                 currToApproach_taskDeadlineSingle,
                 false,
-                false
+                true // Interrupt tick once (we'll process the tick soon later)
         );
 
         this.dispatchMessageNodeAuto(target);
@@ -255,6 +255,8 @@ public class ActorSchedulerThreadPool {
 
         // already dispatched by other
         if (!workerMessageNode.tryPreDispatch(targetWorker)) {
+            // probably already scheduled to target
+            targetWorker.notifyWorker();
             return;
         }
 
@@ -342,7 +344,7 @@ public class ActorSchedulerThreadPool {
         private boolean executed = false;
 
         private boolean mainThreadTaskInterrupted = false;
-        private boolean tickTaskInterrupted = false;
+        private boolean pushTickWithinMinTickDeadlineBuffer = false;
 
         private static final VarHandle OWNER_HANDLE = ConcurrentUtil.getVarHandle(WorkerMessageNode.class, "ownerWorker", WorkerThreadCarrier.class);
 
@@ -378,7 +380,7 @@ public class ActorSchedulerThreadPool {
 
         private void resetContextFlags() {
             this.mainThreadTaskInterrupted = false;
-            this.tickTaskInterrupted = false;
+            this.pushTickWithinMinTickDeadlineBuffer = false;
         }
 
         public void sendMessage(SubMessageNode subMessageNode) {
@@ -413,7 +415,12 @@ public class ActorSchedulerThreadPool {
                 long remaining = System.nanoTime() - tickDeadline;
 
                 // we have enough time for this tick, so reinsert back for load balance
-                if ((remaining + this.tickTimeDeadlineBuffer) < 0 || this.tickTaskInterrupted) {
+                if ((remaining + this.tickTimeDeadlineBuffer) < 0) {
+                    return;
+                }
+
+                // we pushed tick for more task runs
+                if (this.pushTickWithinMinTickDeadlineBuffer && (remaining + ActorSchedulerThreadPool.this.minTickTimeBuffer) < 0) {
                     return;
                 }
 
@@ -421,6 +428,11 @@ public class ActorSchedulerThreadPool {
                     this.processSubMessageNode();
 
                     remaining = System.nanoTime() - tickDeadline;
+
+                    // might someone notified for a task execution within its min time buffer
+                    if (this.pushTickWithinMinTickDeadlineBuffer && (remaining + ActorSchedulerThreadPool.this.minTickTimeBuffer) < 0) {
+                        return;
+                    }
 
                     if (remaining < 0) {
                         LockSupport.parkNanos("AWAIT DEADLINE", 1_000L);
@@ -564,6 +576,10 @@ public class ActorSchedulerThreadPool {
             }
 
             return queued;
+        }
+
+        private void notifyWorker() {
+            LockSupport.unpark(this.runner);
         }
     }
 }
