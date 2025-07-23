@@ -1,0 +1,490 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Helvetica Volubi <suisuroru@blue-millennium.fun>
+Date: Wed, 23 Jul 2025 18:57:03 +0800
+Subject: [PATCH] Override scheduler
+
+
+diff --git a/io/papermc/paper/threadedregions/ThreadedRegionizer.java b/io/papermc/paper/threadedregions/ThreadedRegionizer.java
+index 45aa5484b1cdb317ed55f1b001dbfe13a720b2a7..ba0e3b1f81c34a3e787d390ba364a7802a200502 100644
+--- a/io/papermc/paper/threadedregions/ThreadedRegionizer.java
++++ b/io/papermc/paper/threadedregions/ThreadedRegionizer.java
+@@ -36,14 +36,11 @@ public final class ThreadedRegionizer<R extends ThreadedRegionizer.ThreadedRegio
+     public final int emptySectionCreateRadius;
+     public final int regionSectionMergeRadius;
+     public final double maxDeadRegionPercent;
+-    public final ServerLevel world;
+ 
+-    private final SWMRLong2ObjectHashTable<ThreadedRegionSection<R, S>> sections = new SWMRLong2ObjectHashTable<>();
+-    private final SWMRLong2ObjectHashTable<ThreadedRegion<R, S>> regionsById = new SWMRLong2ObjectHashTable<>();
+-    private final RegionCallbacks<R, S> callbacks;
++    public final java.util.Map<ServerLevel, me.earthme.luminol.threadregions.ThreadedRegions<R, S>> luminolThreadedRegions = new java.util.HashMap<>();
+     private final StampedLock regionLock = new StampedLock();
+     private Thread writeLockOwner;
+-    public final me.earthme.luminol.api.ThreadedRegionizer threadedRegionizerAPI; // Luminol - Tick region API
++    //public final me.earthme.luminol.api.ThreadedRegionizer threadedRegionizerAPI; // Luminol - Tick region API
+ 
+     /*
+     static final record Operation(String type, int chunkX, int chunkZ) {}
+@@ -56,8 +53,7 @@ public final class ThreadedRegionizer<R extends ThreadedRegionizer.ThreadedRegio
+ 
+     public ThreadedRegionizer(final int minSectionRecalcCount, final double maxDeadRegionPercent,
+                               final int emptySectionCreateRadius, final int regionSectionMergeRadius,
+-                              final int regionSectionChunkShift, final ServerLevel world,
+-                              final RegionCallbacks<R, S> callbacks) {
++                              final int regionSectionChunkShift) {
+         if (emptySectionCreateRadius <= 0) {
+             throw new IllegalStateException("Region section create radius must be > 0");
+         }
+@@ -70,10 +66,9 @@ public final class ThreadedRegionizer<R extends ThreadedRegionizer.ThreadedRegio
+         this.maxDeadRegionPercent = maxDeadRegionPercent;
+         this.emptySectionCreateRadius = emptySectionCreateRadius;
+         this.regionSectionMergeRadius = regionSectionMergeRadius;
+-        this.world = world;
+-        this.callbacks = callbacks;
+         //this.loadTestData();
+-        this.threadedRegionizerAPI = new me.earthme.luminol.api.impl.ThreadedRegionizerImpl(this.world); // Luminol - Tick region API
++        // TODO - new api
++        //this.threadedRegionizerAPI = new me.earthme.luminol.api.impl.ThreadedRegionizerImpl(this.world); // Luminol - Tick region API
+     }
+ 
+     /*
+@@ -157,15 +152,15 @@ public final class ThreadedRegionizer<R extends ThreadedRegionizer.ThreadedRegio
+         this.regionLock.tryUnlockWrite();
+     }
+ 
+-    private void onRegionCreate(final ThreadedRegion<R, S> region) {
++    private void onRegionCreate(final ThreadedRegion<R, S> region, ServerLevel world) {
+         final ThreadedRegion<R, S> conflict;
+-        if ((conflict = this.regionsById.putIfAbsent(region.id, region)) != null) {
++        if ((conflict = this.luminolThreadedRegions.get(world).regionsById.putIfAbsent(region.id, region)) != null) {
+             throw new IllegalStateException("Region " + region + " is already mapped to " + conflict);
+         }
+     }
+ 
+-    private void onRegionDestroy(final ThreadedRegion<R, S> region) {
+-        final ThreadedRegion<R, S> removed = this.regionsById.remove(region.id);
++    private void onRegionDestroy(final ThreadedRegion<R, S> region, ServerLevel world) {
++        final ThreadedRegion<R, S> removed = this.luminolThreadedRegions.get(world).regionsById.remove(region.id);
+         if (removed != region) {
+             throw new IllegalStateException("Expected to remove " + region + ", but removed " + removed);
+         }
+@@ -188,21 +183,21 @@ public final class ThreadedRegionizer<R extends ThreadedRegionizer.ThreadedRegio
+         return CoordinateUtils.getChunkKey(pos.x >> this.sectionChunkShift, pos.z >> this.sectionChunkShift);
+     }
+ 
+-    public void computeForAllRegions(final Consumer<? super ThreadedRegion<R, S>> consumer) {
++    public void computeForAllRegions(final Consumer<? super ThreadedRegion<R, S>> consumer, ServerLevel world) {
+         this.regionLock.readLock();
+         try {
+-            this.regionsById.forEachValue(consumer);
++            this.luminolThreadedRegions.get(world).regionsById.forEachValue(consumer);
+         } finally {
+             this.regionLock.tryUnlockRead();
+         }
+     }
+ 
+-    public void computeForAllRegionsUnsynchronised(final Consumer<? super ThreadedRegion<R, S>> consumer) {
+-        this.regionsById.forEachValue(consumer);
++    public void computeForAllRegionsUnsynchronised(final Consumer<? super ThreadedRegion<R, S>> consumer, ServerLevel world) {
++        this.luminolThreadedRegions.get(world).regionsById.forEachValue(consumer);
+     }
+ 
+     public int computeForRegions(final int fromChunkX, final int fromChunkZ, final int toChunkX, final int toChunkZ,
+-                                  final Consumer<Set<ThreadedRegion<R, S>>> consumer) {
++                                  final Consumer<Set<ThreadedRegion<R, S>>> consumer, ServerLevel world) {
+         final int shift = this.sectionChunkShift;
+         final int fromSectionX = fromChunkX >> shift;
+         final int fromSectionZ = fromChunkZ >> shift;
+@@ -214,7 +209,7 @@ public final class ThreadedRegionizer<R extends ThreadedRegionizer.ThreadedRegio
+ 
+             for (int currZ = fromSectionZ; currZ <= toSectionZ; ++currZ) {
+                 for (int currX = fromSectionX; currX <= toSectionX; ++currX) {
+-                    final ThreadedRegionSection<R, S> section = this.sections.get(CoordinateUtils.getChunkKey(currX, currZ));
++                    final ThreadedRegionSection<R, S> section = this.luminolThreadedRegions.get(world).sections.get(CoordinateUtils.getChunkKey(currX, currZ));
+                     if (section != null) {
+                         set.add(section.getRegionPlain());
+                     }
+@@ -229,17 +224,17 @@ public final class ThreadedRegionizer<R extends ThreadedRegionizer.ThreadedRegio
+         }
+     }
+ 
+-    public ThreadedRegion<R, S> getRegionAtUnsynchronised(final int chunkX, final int chunkZ) {
++    public ThreadedRegion<R, S> getRegionAtUnsynchronised(final int chunkX, final int chunkZ, ServerLevel world) {
+         final int sectionX = chunkX >> this.sectionChunkShift;
+         final int sectionZ = chunkZ >> this.sectionChunkShift;
+         final long sectionKey = CoordinateUtils.getChunkKey(sectionX, sectionZ);
+ 
+-        final ThreadedRegionSection<R, S> section = this.sections.get(sectionKey);
++        final ThreadedRegionSection<R, S> section = this.luminolThreadedRegions.get(world).sections.get(sectionKey);
+ 
+         return section == null ? null : section.getRegion();
+     }
+ 
+-    public ThreadedRegion<R, S> getRegionAtSynchronised(final int chunkX, final int chunkZ) {
++    public ThreadedRegion<R, S> getRegionAtSynchronised(final int chunkX, final int chunkZ, ServerLevel world) {
+         final int sectionX = chunkX >> this.sectionChunkShift;
+         final int sectionZ = chunkZ >> this.sectionChunkShift;
+         final long sectionKey = CoordinateUtils.getChunkKey(sectionX, sectionZ);
+@@ -247,7 +242,7 @@ public final class ThreadedRegionizer<R extends ThreadedRegionizer.ThreadedRegio
+         // try an optimistic read
+         {
+             final long readAttempt = this.regionLock.tryOptimisticRead();
+-            final ThreadedRegionSection<R, S> optimisticSection = this.sections.get(sectionKey);
++            final ThreadedRegionSection<R, S> optimisticSection = this.luminolThreadedRegions.get(world).sections.get(sectionKey);
+             final ThreadedRegion<R, S> optimisticRet =
+                 optimisticSection == null ? null : optimisticSection.getRegionPlain();
+             if (this.regionLock.validate(readAttempt)) {
+@@ -258,7 +253,7 @@ public final class ThreadedRegionizer<R extends ThreadedRegionizer.ThreadedRegio
+         // failed, fall back to acquiring the lock
+         this.regionLock.readLock();
+         try {
+-            final ThreadedRegionSection<R, S> section = this.sections.get(sectionKey);
++            final ThreadedRegionSection<R, S> section = this.luminolThreadedRegions.get(world).sections.get(sectionKey);
+ 
+             return section == null ? null : section.getRegionPlain();
+         } finally {
+@@ -275,7 +270,7 @@ public final class ThreadedRegionizer<R extends ThreadedRegionizer.ThreadedRegio
+      * region section in parallel.
+      * </p>
+      */
+-    public void addChunk(final int chunkX, final int chunkZ) {
++    public void addChunk(final int chunkX, final int chunkZ, ServerLevel world) {
+         final int sectionX = chunkX >> this.sectionChunkShift;
+         final int sectionZ = chunkZ >> this.sectionChunkShift;
+         final long sectionKey = CoordinateUtils.getChunkKey(sectionX, sectionZ);
+@@ -283,7 +278,7 @@ public final class ThreadedRegionizer<R extends ThreadedRegionizer.ThreadedRegio
+         // Given that for each section, no addChunk/removeChunk can occur in parallel,
+         // we can avoid the lock IF the section exists AND it has a non-zero chunk count.
+         {
+-            final ThreadedRegionSection<R, S> existing = this.sections.get(sectionKey);
++            final ThreadedRegionSection<R, S> existing = this.luminolThreadedRegions.get(world).sections.get(sectionKey);
+             if (existing != null && !existing.isEmpty()) {
+                 existing.addChunk(chunkX, chunkZ);
+                 return;
+@@ -292,14 +287,14 @@ public final class ThreadedRegionizer<R extends ThreadedRegionizer.ThreadedRegio
+ 
+         this.acquireWriteLock();
+         try {
+-            ThreadedRegionSection<R, S> section = this.sections.get(sectionKey);
++            ThreadedRegionSection<R, S> section = this.luminolThreadedRegions.get(world).sections.get(sectionKey);
+ 
+             List<ThreadedRegionSection<R, S>> newSections = new ArrayList<>();
+ 
+             if (section == null) {
+                 // no section at all
+-                section = new ThreadedRegionSection<>(sectionX, sectionZ, this, chunkX, chunkZ);
+-                this.sections.put(sectionKey, section);
++                section = new ThreadedRegionSection<>(sectionX, sectionZ, this, chunkX, chunkZ, world);
++                this.luminolThreadedRegions.get(world).sections.put(sectionKey, section);
+                 newSections.add(section);
+             } else {
+                 section.addChunk(chunkX, chunkZ);
+@@ -322,7 +317,7 @@ public final class ThreadedRegionizer<R extends ThreadedRegionizer.ThreadedRegio
+                     final int neighbourZ = dz + sectionZ;
+                     final long neighbourKey = CoordinateUtils.getChunkKey(neighbourX, neighbourZ);
+ 
+-                    ThreadedRegionSection<R, S> neighbourSection = this.sections.get(neighbourKey);
++                    ThreadedRegionSection<R, S> neighbourSection = this.luminolThreadedRegions.get(world).sections.get(neighbourKey);
+ 
+                     if (neighbourSection != null) {
+                         if (nearbyRegions == null) {
+@@ -341,8 +336,8 @@ public final class ThreadedRegionizer<R extends ThreadedRegionizer.ThreadedRegio
+                         neighbourSection.incrementNonEmptyNeighbours();
+                         continue;
+                     }
+-                    neighbourSection = new ThreadedRegionSection<>(neighbourX, neighbourZ, this, 1);
+-                    if (null != this.sections.put(neighbourKey, neighbourSection)) {
++                    neighbourSection = new ThreadedRegionSection<>(neighbourX, neighbourZ, this, 1, world);
++                    if (null != this.luminolThreadedRegions.get(world).sections.put(neighbourKey, neighbourSection)) {
+                         throw new IllegalStateException("Failed to insert new section");
+                     }
+                     newSections.add(neighbourSection);
+@@ -358,7 +353,7 @@ public final class ThreadedRegionizer<R extends ThreadedRegionizer.ThreadedRegio
+             final boolean regionOfInterestAlive;
+             if (nearbyRegions == null) {
+                 // we can simply create a new region, don't have neighbours to worry about merging into
+-                regionOfInterest = new ThreadedRegion<>(this);
++                regionOfInterest = new ThreadedRegion<>(this, world);
+                 regionOfInterestAlive = true;
+ 
+                 for (int i = 0, len = newSections.size(); i < len; ++i) {
+@@ -385,7 +380,7 @@ public final class ThreadedRegionizer<R extends ThreadedRegionizer.ThreadedRegio
+                 if (firstUnlockedRegion != null) {
+                     regionOfInterest = firstUnlockedRegion;
+                 } else {
+-                    regionOfInterest = new ThreadedRegion<>(this);
++                    regionOfInterest = new ThreadedRegion<>(this, world);
+                 }
+ 
+                 for (int i = 0, len = newSections.size(); i < len; ++i) {
+@@ -420,7 +415,7 @@ public final class ThreadedRegionizer<R extends ThreadedRegionizer.ThreadedRegio
+                     // we need to retire this region if the merges added other pending merges
+                     if (!firstUnlockedRegion.mergeIntoLater.isEmpty() || !firstUnlockedRegion.expectingMergeFrom.isEmpty()) {
+                         firstUnlockedRegion.state = ThreadedRegion.STATE_TRANSIENT;
+-                        this.callbacks.onRegionInactive(firstUnlockedRegion);
++                        this.luminolThreadedRegions.get(world).callbacks.onRegionInactive(firstUnlockedRegion);
+                     }
+                 }
+ 
+@@ -433,7 +428,7 @@ public final class ThreadedRegionizer<R extends ThreadedRegionizer.ThreadedRegio
+                 if (!regionOfInterest.mergeIntoLater.isEmpty() || !regionOfInterest.expectingMergeFrom.isEmpty()) {
+                     throw new IllegalStateException("Should not happen on region " + this);
+                 }
+-                this.callbacks.onRegionActive(regionOfInterest);
++                this.luminolThreadedRegions.get(world).callbacks.onRegionActive(regionOfInterest);
+             }
+ 
+             if (regionOfInterest.state == ThreadedRegion.STATE_READY) {
+@@ -450,14 +445,14 @@ public final class ThreadedRegionizer<R extends ThreadedRegionizer.ThreadedRegio
+         }
+     }
+ 
+-    public void removeChunk(final int chunkX, final int chunkZ) {
++    public void removeChunk(final int chunkX, final int chunkZ, final ServerLevel world) {
+         final int sectionX = chunkX >> this.sectionChunkShift;
+         final int sectionZ = chunkZ >> this.sectionChunkShift;
+         final long sectionKey = CoordinateUtils.getChunkKey(sectionX, sectionZ);
+ 
+         // Given that for each section, no addChunk/removeChunk can occur in parallel,
+         // we can avoid the lock IF the section exists AND it has a chunk count > 1
+-        final ThreadedRegionSection<R, S> section = this.sections.get(sectionKey);
++        final ThreadedRegionSection<R, S> section = this.luminolThreadedRegions.get(world).sections.get(sectionKey);
+         if (section == null) {
+             throw new IllegalStateException("Chunk (" + chunkX + "," + chunkZ + ") has no section");
+         }
+@@ -482,7 +477,7 @@ public final class ThreadedRegionizer<R extends ThreadedRegionizer.ThreadedRegio
+                     final int neighbourZ = dz + sectionZ;
+                     final long neighbourKey = CoordinateUtils.getChunkKey(neighbourX, neighbourZ);
+ 
+-                    final ThreadedRegionSection<R, S> neighbourSection = this.sections.get(neighbourKey);
++                    final ThreadedRegionSection<R, S> neighbourSection = this.luminolThreadedRegions.get(world).sections.get(neighbourKey);
+ 
+                     // should be non-null here always
+                     neighbourSection.decrementNonEmptyNeighbours();
+@@ -498,7 +493,7 @@ public final class ThreadedRegionizer<R extends ThreadedRegionizer.ThreadedRegio
+     }
+ 
+     // must hold regionLock
+-    private void onRegionRelease(final ThreadedRegion<R, S> region) {
++    private void onRegionRelease(final ThreadedRegion<R, S> region, final ServerLevel world) {
+         if (!region.mergeIntoLater.isEmpty()) {
+             throw new IllegalStateException("Region " + region + " should not have any regions to merge into!");
+         }
+@@ -522,7 +517,7 @@ public final class ThreadedRegionizer<R extends ThreadedRegionizer.ThreadedRegio
+             if (!region.mergeIntoLater.isEmpty()) {
+                 // There is another nearby ticking region that we need to merge into
+                 region.state = ThreadedRegion.STATE_TRANSIENT;
+-                this.callbacks.onRegionInactive(region);
++                this.luminolThreadedRegions.get(world).callbacks.onRegionInactive(region);
+                 // return to avoid removing dead sections or splitting, these actions will be performed
+                 // by the region we merge into
+                 return;
+@@ -547,9 +542,9 @@ public final class ThreadedRegionizer<R extends ThreadedRegionizer.ThreadedRegio
+                 if (!region.sectionByKey.remove(key, deadSection)) {
+                     throw new IllegalStateException("Region " + region + " has inconsistent state, it should contain section " + deadSection);
+                 }
+-                if (this.sections.remove(key) != deadSection) {
++                if (this.luminolThreadedRegions.get(world).sections.remove(key) != deadSection) {
+                     throw new IllegalStateException("Cannot remove dead section '" +
+-                        deadSection.toStringWithRegion() + "' from section state! State at section coordinate: " + this.sections.get(key));
++                        deadSection.toStringWithRegion() + "' from section state! State at section coordinate: " + this.luminolThreadedRegions.get(world).sections.get(key));
+                 }
+             }
+             region.deadSections.clear();
+@@ -572,7 +567,7 @@ public final class ThreadedRegionizer<R extends ThreadedRegionizer.ThreadedRegio
+         if (recalculateSections.isEmpty()) {
+             // looks like the region's sections were all dead, and now there is no region at all
+             region.state = ThreadedRegion.STATE_DEAD;
+-            region.onRemove(true);
++            region.onRemove(true, world);
+             return;
+         }
+ 
+@@ -632,14 +627,14 @@ public final class ThreadedRegionizer<R extends ThreadedRegionizer.ThreadedRegio
+ 
+         final List<ThreadedRegion<R, S>> newRegionObjects = new ArrayList<>(newRegions.size());
+         for (int i = 0, len = newRegions.size(); i < len; ++i) {
+-            newRegionObjects.add(new ThreadedRegion<>(this));
++            newRegionObjects.add(new ThreadedRegion<>(this, world));
+         }
+ 
+-        this.callbacks.preSplit(region, newRegionObjects);
++        this.luminolThreadedRegions.get(world).callbacks.preSplit(region, newRegionObjects);
+ 
+         // need to split the region, so we need to kill the old one first
+         region.state = ThreadedRegion.STATE_DEAD;
+-        region.onRemove(true);
++        region.onRemove(true, world);
+ 
+         // create new regions
+         final Long2ReferenceOpenHashMap<ThreadedRegion<R, S>> newRegionsMap = new Long2ReferenceOpenHashMap<>();
+@@ -669,7 +664,7 @@ public final class ThreadedRegionizer<R extends ThreadedRegionizer.ThreadedRegio
+                 throw new IllegalStateException("Illegal state " + newRegion);
+             }
+             newRegion.onCreate();
+-            this.callbacks.onRegionActive(newRegion);
++            this.luminolThreadedRegions.get(world).callbacks.onRegionActive(newRegion);
+         }
+     }
+ 
+@@ -693,15 +688,18 @@ public final class ThreadedRegionizer<R extends ThreadedRegionizer.ThreadedRegio
+ 
+         private final R data;
+ 
++        private final ServerLevel world;
++
+         private final ReferenceOpenHashSet<ThreadedRegion<R, S>> mergeIntoLater = new ReferenceOpenHashSet<>();
+         private final ReferenceOpenHashSet<ThreadedRegion<R, S>> expectingMergeFrom = new ReferenceOpenHashSet<>();
+         public final me.earthme.luminol.api.ThreadedRegion threadedRegionAPI = new me.earthme.luminol.api.impl.ThreadedRegionImpl((ThreadedRegion<TickRegions.TickRegionData, TickRegions.TickRegionSectionData>) this); // Luminol - Tickregion API
+ 
+-        public ThreadedRegion(final ThreadedRegionizer<R, S> regioniser) {
++        public ThreadedRegion(final ThreadedRegionizer<R, S> regioniser, ServerLevel world) {
+             this.regioniser = regioniser;
++            this.world = world;
+             this.id = REGION_ID_GENERATOR.getAndIncrement();
+             this.state = STATE_TRANSIENT;
+-            this.data = regioniser.callbacks.createNewData(this);
++            this.data = regioniser.luminolThreadedRegions.get(world).callbacks.createNewData(this);
+         }
+ 
+         public LongArrayList getOwnedSections() {
+@@ -806,16 +804,16 @@ public final class ThreadedRegionizer<R extends ThreadedRegionizer.ThreadedRegio
+         }
+ 
+         private void onCreate() {
+-            this.regioniser.onRegionCreate(this);
+-            this.regioniser.callbacks.onRegionCreate(this);
++            this.regioniser.onRegionCreate(this, world);
++            this.regioniser.luminolThreadedRegions.get(world).callbacks.onRegionCreate(this);
+         }
+ 
+-        private void onRemove(final boolean wasActive) {
++        private void onRemove(final boolean wasActive, final ServerLevel world) {
+             if (wasActive) {
+-                this.regioniser.callbacks.onRegionInactive(this);
++                this.regioniser.luminolThreadedRegions.get(world).callbacks.onRegionInactive(this);
+             }
+-            this.regioniser.callbacks.onRegionDestroy(this);
+-            this.regioniser.onRegionDestroy(this);
++            this.regioniser.luminolThreadedRegions.get(world).callbacks.onRegionDestroy(this);
++            this.regioniser.onRegionDestroy(this, world);
+         }
+ 
+         private final boolean hasNoAliveSections() {
+@@ -837,7 +835,7 @@ public final class ThreadedRegionizer<R extends ThreadedRegionizer.ThreadedRegio
+                 return false;
+             }
+ 
+-            this.regioniser.callbacks.preMerge(this, mergeTarget);
++            this.regioniser.luminolThreadedRegions.get(world).callbacks.preMerge(this, mergeTarget);
+ 
+             this.tryKill();
+ 
+@@ -909,12 +907,12 @@ public final class ThreadedRegionizer<R extends ThreadedRegionizer.ThreadedRegio
+             switch (this.state) {
+                 case STATE_TRANSIENT: {
+                     this.state = STATE_DEAD;
+-                    this.onRemove(false);
++                    this.onRemove(false, world);
+                     return true;
+                 }
+                 case STATE_READY: {
+                     this.state = STATE_DEAD;
+-                    this.onRemove(true);
++                    this.onRemove(true, world);
+                     return true;
+                 }
+                 case STATE_TICKING: {
+@@ -984,7 +982,7 @@ public final class ThreadedRegionizer<R extends ThreadedRegionizer.ThreadedRegio
+                     throw new IllegalStateException("Attempting to release non-locked state");
+                 }
+ 
+-                this.regioniser.onRegionRelease(this);
++                this.regioniser.onRegionRelease(this, world);
+ 
+                 return this.state == STATE_READY;
+             } catch (final Throwable throwable) {
+@@ -1055,7 +1053,7 @@ public final class ThreadedRegionizer<R extends ThreadedRegionizer.ThreadedRegio
+         }
+ 
+         // creates an empty section with zero non-empty neighbours
+-        private ThreadedRegionSection(final int sectionX, final int sectionZ, final ThreadedRegionizer<R, S> regioniser) {
++        private ThreadedRegionSection(final int sectionX, final int sectionZ, final ThreadedRegionizer<R, S> regioniser, ServerLevel world) {
+             this.sectionX = sectionX;
+             this.sectionZ = sectionZ;
+             this.sectionKey = CoordinateUtils.getChunkKey(sectionX, sectionZ);
+@@ -1063,14 +1061,14 @@ public final class ThreadedRegionizer<R extends ThreadedRegionizer.ThreadedRegio
+             this.regioniser = regioniser;
+             this.regionChunkShift = regioniser.sectionChunkShift;
+             this.regionChunkMask = regioniser.regionSectionChunkSize - 1;
+-            this.data = regioniser.callbacks
++            this.data = regioniser.luminolThreadedRegions.get(world).callbacks
+                 .createNewSectionData(sectionX, sectionZ, this.regionChunkShift);
+         }
+ 
+         // creates a section with an initial chunk with zero non-empty neighbours
+         private ThreadedRegionSection(final int sectionX, final int sectionZ, final ThreadedRegionizer<R, S> regioniser,
+-                                      final int chunkXInit, final int chunkZInit) {
+-            this(sectionX, sectionZ, regioniser);
++                                      final int chunkXInit, final int chunkZInit, ServerLevel world) {
++            this(sectionX, sectionZ, regioniser, world);
+ 
+             final int initIndex = this.getChunkIndex(chunkXInit, chunkZInit);
+             this.chunkCount = 1;
+@@ -1079,8 +1077,8 @@ public final class ThreadedRegionizer<R extends ThreadedRegionizer.ThreadedRegio
+ 
+         // creates an empty section with the specified number of non-empty neighbours
+         private ThreadedRegionSection(final int sectionX, final int sectionZ, final ThreadedRegionizer<R, S> regioniser,
+-                                      final int nonEmptyNeighbours) {
+-            this(sectionX, sectionZ, regioniser);
++                                      final int nonEmptyNeighbours, ServerLevel world) {
++            this(sectionX, sectionZ, regioniser, world);
+ 
+             this.nonEmptyNeighbours = nonEmptyNeighbours;
+         }
+diff --git a/io/papermc/paper/threadedregions/TickRegionScheduler.java b/io/papermc/paper/threadedregions/TickRegionScheduler.java
+index 0357792de0ed8ec9058d1847c8b45c33ff365af6..2c62840bc27fee98041ee870b9527c0880b2e9c7 100644
+--- a/io/papermc/paper/threadedregions/TickRegionScheduler.java
++++ b/io/papermc/paper/threadedregions/TickRegionScheduler.java
+@@ -92,11 +92,13 @@ public final class TickRegionScheduler {
+         }
+         tickThreadRunner.currentTickingRegion = region;
+         if (region != null) {
+-            tickThreadRunner.currentTickingWorldRegionizedData = region.regioniser.world.worldRegionData.get();
+-            // Folia start - profiler
+-            final ca.spottedleaf.leafprofiler.RegionizedProfiler.Handle profiler = region.getData().profiler;
+-            tickThreadRunner.profiler = profiler == null ? ca.spottedleaf.leafprofiler.RegionizedProfiler.Handle.NO_OP_HANDLE : profiler;
+-            // Folia end - profiler
++            for (ServerLevel world : region.regioniser.luminolThreadedRegions.keySet()) {
++                tickThreadRunner.currentTickingWorldRegionizedData = world.worldRegionData.get();
++                // Folia start - profiler
++                final ca.spottedleaf.leafprofiler.RegionizedProfiler.Handle profiler = region.getData().profiler;
++                tickThreadRunner.profiler = profiler == null ? ca.spottedleaf.leafprofiler.RegionizedProfiler.Handle.NO_OP_HANDLE : profiler;
++                // Folia end - profiler
++            }
+         } else {
+             tickThreadRunner.currentTickingWorldRegionizedData = null;
+             tickThreadRunner.profiler = ca.spottedleaf.leafprofiler.RegionizedProfiler.Handle.NO_OP_HANDLE; // Folia - profiler
+diff --git a/net/minecraft/server/level/ServerLevel.java b/net/minecraft/server/level/ServerLevel.java
+index 87377bba2ebdc0eba5b7b212d971994c35ca0b62..43b7fcf966445743c3f7ec264a1a225e80b6e7cd 100644
+--- a/net/minecraft/server/level/ServerLevel.java
++++ b/net/minecraft/server/level/ServerLevel.java
+@@ -639,18 +639,6 @@ public class ServerLevel extends Level implements ServerEntityGetter, WorldGenLe
+ 
+     // Folia start - region threading
+     public final io.papermc.paper.threadedregions.TickRegions tickRegions = new io.papermc.paper.threadedregions.TickRegions();
+-    public final io.papermc.paper.threadedregions.ThreadedRegionizer<io.papermc.paper.threadedregions.TickRegions.TickRegionData, io.papermc.paper.threadedregions.TickRegions.TickRegionSectionData> regioniser;
+-    {
+-        this.regioniser = new io.papermc.paper.threadedregions.ThreadedRegionizer<>(
+-                (int)Math.max(1L, (8L * 16L * 16L) / (1L << (2 * (io.papermc.paper.threadedregions.TickRegions.getRegionChunkShift())))),
+-                (1.0 / 6.0),
+-                Math.max(1, 8 / (1 << io.papermc.paper.threadedregions.TickRegions.getRegionChunkShift())),
+-                1,
+-                io.papermc.paper.threadedregions.TickRegions.getRegionChunkShift(),
+-                this,
+-                this.tickRegions
+-        );
+-    }
+     public final io.papermc.paper.threadedregions.RegionizedTaskQueue.WorldRegionTaskData taskQueueRegionData = new io.papermc.paper.threadedregions.RegionizedTaskQueue.WorldRegionTaskData(this);
+     public static final int WORLD_INIT_NOT_CHECKED = 0;
+     public static final int WORLD_INIT_CHECKING = 1;
