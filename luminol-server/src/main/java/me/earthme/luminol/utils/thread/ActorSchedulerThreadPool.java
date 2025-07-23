@@ -280,7 +280,12 @@ public class ActorSchedulerThreadPool {
         // already dispatched by other
         if (!workerMessageNode.tryPreDispatch(targetWorker)) {
             // probably already scheduled to target
-            targetWorker.notifyWorker();
+            final WorkerThreadCarrier currBelongTo = workerMessageNode.getOwnerWorker();
+
+            if (currBelongTo != null) {
+                currBelongTo.notifyWorker();
+            }
+
             return;
         }
 
@@ -296,7 +301,6 @@ public class ActorSchedulerThreadPool {
         private static final AtomicLong ID_GENERATOR = new AtomicLong();
         public final long id = ID_GENERATOR.getAndIncrement();
         private long scheduledStart = DEADLINE_NOT_SET;
-
 
         public final long getScheduledStart() {
             return this.scheduledStart;
