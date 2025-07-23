@@ -9,6 +9,7 @@ import org.jetbrains.annotations.Nullable;
 
 import java.lang.invoke.VarHandle;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -143,6 +144,17 @@ public class ActorSchedulerThreadPool {
             worker.killSignal();
         }
 
+        // stop these threads from ticking
+        for (WorkerMessageNode node : this.taskBandings.values()) {
+            this.modifyValueOfTask(
+                    node,
+                    this.minTickTimeBuffer,
+                    this.maxTaskDeadlineOffset,
+                    true,
+                    true
+            );
+        }
+
         WorkerThreadCarrier worker;
         while ((worker = this.workers.pollOrBlockAdds()) != null) {
             for (;;) {
@@ -182,11 +194,12 @@ public class ActorSchedulerThreadPool {
 
         final SubMessageNode wrappedAction = new SubMessageNode(action, target, () -> action.accept(null));
 
-        target.sendMessage(wrappedAction);
-        target.notifyReceiver();
+        if (target.sendMessage(wrappedAction)) {
+            target.notifyReceiver();
+        }
     }
 
-    private @NotNull WorkerThreadCarrier selectWorker() {
+    private @Nullable WorkerThreadCarrier selectWorker() {
         WorkerThreadCarrier previousLessTask = null;
 
         for (WorkerThreadCarrier workerThreadCarrier : this.workers) {
@@ -210,7 +223,10 @@ public class ActorSchedulerThreadPool {
             }
         }
 
-        assert previousLessTask != null;
+        if (previousLessTask == null) {
+            // might only 1 thread available, so return the head one
+            previousLessTask = this.workers.peek();
+        }
 
         return previousLessTask;
     }
@@ -234,7 +250,7 @@ public class ActorSchedulerThreadPool {
                 true // Interrupt tick once (we'll process the tick soon later)
         );
 
-        this.dispatchMessageNodeAuto(target);
+        this.dispatchMessageNodeAuto(target, false);
     }
 
     public void schedule(SchedulableTick task) {
@@ -243,15 +259,23 @@ public class ActorSchedulerThreadPool {
         this.taskBandings.put(task, created);
         LockSupport.unpark(this.managerThread);
 
-        this.dispatchMessageNodeAuto(created);
+        this.dispatchMessageNodeAuto(created, false);
     }
 
     private void removeMessageNode(@NotNull WorkerMessageNode messageNode) {
         this.taskBandings.remove(messageNode.internal);
     }
 
-    private void dispatchMessageNodeAuto(@NotNull WorkerMessageNode workerMessageNode) {
+    private void dispatchMessageNodeAuto(@NotNull WorkerMessageNode workerMessageNode, boolean insideDispatcherContextOrCall) {
         final WorkerThreadCarrier targetWorker = this.selectWorker();
+
+        if (targetWorker == null) { // no threads available, might be shut down
+            if (insideDispatcherContextOrCall) {
+                return;
+            }
+
+            throw new RejectedExecutionException("shutdown");
+        }
 
         // already dispatched by other
         if (!workerMessageNode.tryPreDispatch(targetWorker)) {
@@ -263,7 +287,7 @@ public class ActorSchedulerThreadPool {
         if (!targetWorker.message(workerMessageNode) && !this.shutdown.get()) {
             workerMessageNode.cleanOwnerWorker(); // we need to reset this to prevent task losing from queue
 
-            this.dispatchMessageNodeAuto(workerMessageNode);
+            this.dispatchMessageNodeAuto(workerMessageNode, true);
         }
     }
 
@@ -383,8 +407,8 @@ public class ActorSchedulerThreadPool {
             this.pushTickWithinMinTickDeadlineBuffer = false;
         }
 
-        public void sendMessage(SubMessageNode subMessageNode) {
-            this.subMessageNodes.offer(subMessageNode);
+        public boolean sendMessage(SubMessageNode subMessageNode) {
+            return this.subMessageNodes.offer(subMessageNode);
         }
 
         public void doMessageProcess() {
@@ -444,7 +468,7 @@ public class ActorSchedulerThreadPool {
                     break;
                 }
             }finally {
-                this.finalizeSubMsgBelongToSelf();
+                this.finalizeSubMsgBelongToSelf(false);
                 this.resetContextFlags();
 
                 this.wannaReinsert = !canceled;
@@ -461,9 +485,9 @@ public class ActorSchedulerThreadPool {
             }
         }
 
-        public void finalizeSubMsgBelongToSelf() {
+        public void finalizeSubMsgBelongToSelf(boolean canceled) {
             SubMessageNode subMessageNode;
-            while ((subMessageNode = this.subMessageNodes.poll()) != null) {
+            while ((subMessageNode = canceled ? this.subMessageNodes.pollOrBlockAdds() : this.subMessageNodes.poll()) != null) {
                 try {
                     subMessageNode.doFinalized();
                 }catch (Exception ex) {
@@ -472,6 +496,10 @@ public class ActorSchedulerThreadPool {
                     ActorSchedulerThreadPool.this.exceptionHandler.uncaughtException(owner != null ? owner.runner : null, ex);
                 }
             }
+        }
+
+        public void onCancelled() {
+            this.finalizeSubMsgBelongToSelf(true);
         }
     }
 
@@ -522,8 +550,10 @@ public class ActorSchedulerThreadPool {
                     final boolean executed = result.right();
 
                     if (wannaReinsert) {
-                        ActorSchedulerThreadPool.this.dispatchMessageNodeAuto(incomingMessage);
+                        ActorSchedulerThreadPool.this.dispatchMessageNodeAuto(incomingMessage, true);
                     }else {
+                        incomingMessage.onCancelled();
+
                         ActorSchedulerThreadPool.this.removeMessageNode(incomingMessage);
                     }
 
