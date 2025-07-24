@@ -2,16 +2,15 @@ package me.earthme.luminol.utils.thread;
 
 import ca.spottedleaf.concurrentutil.collection.MultiThreadedQueue;
 import ca.spottedleaf.concurrentutil.util.ConcurrentUtil;
+import ca.spottedleaf.concurrentutil.util.TimeUtil;
 import me.earthme.luminol.utils.Pair;
 import org.jetbrains.annotations.Contract;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
 import java.lang.invoke.VarHandle;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.RejectedExecutionException;
-import java.util.concurrent.ThreadFactory;
-import java.util.concurrent.TimeUnit;
+import java.util.Comparator;
+import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -23,7 +22,7 @@ public class ActorSchedulerThreadPool {
     public static final long DEADLINE_NOT_SET = Long.MIN_VALUE;
 
     private final ThreadFactory threadFactory;
-    private final MultiThreadedQueue<WorkerThreadCarrier> workers = new MultiThreadedQueue<>();
+    private final CopyOnWriteArrayList<SchedulerWorkerThreadCarrier> workers = new CopyOnWriteArrayList<>();
     private final ConcurrentHashMap<SchedulableTick, WorkerMessageNode> taskBandings = new ConcurrentHashMap<>();
     private final Thread.UncaughtExceptionHandler exceptionHandler;
     private final Thread managerThread;
@@ -47,9 +46,9 @@ public class ActorSchedulerThreadPool {
         this.managerThread = this.threadFactory.newThread(this::managerThreadLogic);
 
         for (int i = 0; i < nThreads; i++) {
-            final WorkerThreadCarrier createdWorker = new WorkerThreadCarrier(this.threadFactory);
+            final SchedulerWorkerThreadCarrier createdWorker = new SchedulerWorkerThreadCarrier(this.threadFactory);
 
-            this.workers.offer(createdWorker);
+            this.workers.add(createdWorker);
         }
     }
 
@@ -66,7 +65,7 @@ public class ActorSchedulerThreadPool {
     }
 
     public Thread[] getThreads() {
-        final WorkerThreadCarrier[] workers = this.workers.toArray(new WorkerThreadCarrier[0]);
+        final SchedulerWorkerThreadCarrier[] workers = this.workers.toArray(new SchedulerWorkerThreadCarrier[0]);
 
         final Thread[] ret = new Thread[workers.length + 1];
 
@@ -97,13 +96,13 @@ public class ActorSchedulerThreadPool {
             LockSupport.parkNanos(100);
         }
     }
-    
+
     private void managerThreadLogic() {
         while (!this.shutdown.get()) {
             try {
                 if (!this.booted) {
-                    for (WorkerThreadCarrier workerThreadCarrier : this.workers) {
-                        workerThreadCarrier.kickOff();
+                    for (SchedulerWorkerThreadCarrier schedulerWorkerThreadCarrier : this.workers) {
+                        schedulerWorkerThreadCarrier.kickOff();
                     }
 
                     this.booted = true;
@@ -112,11 +111,6 @@ public class ActorSchedulerThreadPool {
                 final int totalThreads = this.workers.size();
 
                 double totalTaskHitPct = 0;
-
-                for (WorkerThreadCarrier carrier : this.workers) {
-                    totalTaskHitPct += (double) carrier.validTaskExecutedCnt.get() / carrier.loopedTimes.get();
-                }
-
                 final double avgTaskHitPct = Math.min(totalTaskHitPct / totalThreads, 1.0D);
 
                 this.lastAvgHitPct = avgTaskHitPct;
@@ -140,7 +134,7 @@ public class ActorSchedulerThreadPool {
             }
         }
 
-        for (WorkerThreadCarrier worker : this.workers) {
+        for (SchedulerWorkerThreadCarrier worker : this.workers) {
             worker.killSignal();
         }
 
@@ -155,10 +149,10 @@ public class ActorSchedulerThreadPool {
             );
         }
 
-        WorkerThreadCarrier worker;
-        while ((worker = this.workers.pollOrBlockAdds()) != null) {
+        SchedulerWorkerThreadCarrier worker;
+        while (!this.workers.isEmpty() && (worker = this.workers.removeFirst()) != null) {
             for (;;) {
-                if (worker.status.get() != WorkerThreadCarrier.STATUS_SHUTDOWN) {
+                if (worker.status.get() != SchedulerWorkerThreadCarrier.STATUS_SHUTDOWN) {
                     Thread.yield();
                     LockSupport.parkNanos(1_000_000L);
                     continue;
@@ -199,36 +193,44 @@ public class ActorSchedulerThreadPool {
         }
     }
 
-    private @Nullable WorkerThreadCarrier selectWorker() {
-        WorkerThreadCarrier previousLessTask = null;
+    private @Nullable ActorSchedulerThreadPool.SchedulerWorkerThreadCarrier selectWorker(boolean lightFirst) {
+        SchedulerWorkerThreadCarrier result = null;
 
-        for (WorkerThreadCarrier workerThreadCarrier : this.workers) {
-            if (previousLessTask == null) {
-                previousLessTask = workerThreadCarrier;
+        for (SchedulerWorkerThreadCarrier worker : this.workers) {
+            if (result == null) {
+                result = worker;
             }
 
-            final int status = workerThreadCarrier.status.get();
+            final int status = worker.status.get();
 
-            if (status == WorkerThreadCarrier.STATUS_IDLE) {
-                return workerThreadCarrier;
-            }
+            if (lightFirst) {
+                if (status == SchedulerWorkerThreadCarrier.STATUS_IDLE) {
+                    return worker;
+                }
 
-            if (previousLessTask.runner == Thread.currentThread()) {
-                previousLessTask = null;
+                final double hitPctOfCurr = (double) result.validTaskExecutedCnt.get() / (double) result.loopedTimes.get();
+                final double hitPctOfNew = (double) worker.validTaskExecutedCnt.get() / (double) worker.loopedTimes.get();
+
+                if (hitPctOfNew <= hitPctOfCurr) {
+                    result = worker;
+                }
+
                 continue;
             }
 
-            if (workerThreadCarrier.validTaskExecutedCnt.get() < previousLessTask.validTaskExecutedCnt.get()) {
-                previousLessTask = workerThreadCarrier;
+            if (status == SchedulerWorkerThreadCarrier.STATUS_BUSY) {
+                return worker;
+            }
+
+            final double hitPctOfCurr = (double) result.validTaskExecutedCnt.get() / (double) result.loopedTimes.get();
+            final double hitPctOfNew = (double) worker.validTaskExecutedCnt.get() / (double) worker.loopedTimes.get();
+
+            if (hitPctOfNew > hitPctOfCurr) {
+                result = worker;
             }
         }
 
-        if (previousLessTask == null) {
-            // might only 1 thread available, so return the head one
-            previousLessTask = this.workers.peek();
-        }
-
-        return previousLessTask;
+        return result;
     }
 
     public void notifyTask(SchedulableTick task) {
@@ -267,7 +269,7 @@ public class ActorSchedulerThreadPool {
     }
 
     private void dispatchMessageNodeAuto(@NotNull WorkerMessageNode workerMessageNode, boolean insideDispatcherContextOrCall) {
-        final WorkerThreadCarrier targetWorker = this.selectWorker();
+        final SchedulerWorkerThreadCarrier targetWorker = this.selectWorker(true);
 
         if (targetWorker == null) { // no threads available, might be shut down
             if (insideDispatcherContextOrCall) {
@@ -280,7 +282,7 @@ public class ActorSchedulerThreadPool {
         // already dispatched by other
         if (!workerMessageNode.tryPreDispatch(targetWorker)) {
             // probably already scheduled to target
-            final WorkerThreadCarrier currBelongTo = workerMessageNode.getOwnerWorker();
+            final SchedulerWorkerThreadCarrier currBelongTo = workerMessageNode.getOwnerWorker();
 
             if (currBelongTo != null) {
                 currBelongTo.notifyWorker();
@@ -366,7 +368,7 @@ public class ActorSchedulerThreadPool {
         private long tickTimeDeadlineBuffer = ActorSchedulerThreadPool.this.maxTickTimeBuffer;
         private long mainThreadTaskPeriod = ActorSchedulerThreadPool.this.maxTaskDeadlineOffset;
 
-        private WorkerThreadCarrier ownerWorker;
+        private SchedulerWorkerThreadCarrier ownerWorker;
 
         private boolean wannaReinsert = true;
         private boolean executed = false;
@@ -374,17 +376,21 @@ public class ActorSchedulerThreadPool {
         private boolean mainThreadTaskInterrupted = false;
         private boolean pushTickWithinMinTickDeadlineBuffer = false;
 
-        private static final VarHandle OWNER_HANDLE = ConcurrentUtil.getVarHandle(WorkerMessageNode.class, "ownerWorker", WorkerThreadCarrier.class);
+        private static final VarHandle OWNER_HANDLE = ConcurrentUtil.getVarHandle(WorkerMessageNode.class, "ownerWorker", SchedulerWorkerThreadCarrier.class);
 
         private WorkerMessageNode(SchedulableTick internal) {
             this.internal = internal;
         }
 
-        public boolean tryPreDispatch(WorkerThreadCarrier carrier) {
+        public boolean tryPreDispatch(SchedulerWorkerThreadCarrier carrier) {
             return this.trySetWorker(carrier);
         }
 
-        public boolean trySetWorker(WorkerThreadCarrier ownerWorker) {
+        public void setWorker(SchedulerWorkerThreadCarrier carrier) {
+            OWNER_HANDLE.setVolatile(this, carrier);
+        }
+
+        public boolean trySetWorker(SchedulerWorkerThreadCarrier ownerWorker) {
             return OWNER_HANDLE.compareAndSet(this, null, ownerWorker);
         }
 
@@ -392,12 +398,12 @@ public class ActorSchedulerThreadPool {
             OWNER_HANDLE.setVolatile(this, null);
         }
 
-        private WorkerThreadCarrier getOwnerWorker() {
-            return (WorkerThreadCarrier) OWNER_HANDLE.getVolatile(this);
+        private SchedulerWorkerThreadCarrier getOwnerWorker() {
+            return (SchedulerWorkerThreadCarrier) OWNER_HANDLE.getVolatile(this);
         }
 
         public void notifyReceiver() {
-            final WorkerThreadCarrier owner = (WorkerThreadCarrier) OWNER_HANDLE.getVolatile(this);
+            final SchedulerWorkerThreadCarrier owner = (SchedulerWorkerThreadCarrier) OWNER_HANDLE.getVolatile(this);
 
             if (owner == null) {
                 return;
@@ -495,7 +501,7 @@ public class ActorSchedulerThreadPool {
                 try {
                     subMessageNode.doFinalized();
                 }catch (Exception ex) {
-                    final WorkerThreadCarrier owner = this.getOwnerWorker();
+                    final SchedulerWorkerThreadCarrier owner = this.getOwnerWorker();
 
                     ActorSchedulerThreadPool.this.exceptionHandler.uncaughtException(owner != null ? owner.runner : null, ex);
                 }
@@ -507,14 +513,115 @@ public class ActorSchedulerThreadPool {
         }
     }
 
-    private final class WorkerThreadCarrier implements Runnable {
+    // use this to implement the "pollOrBlockAdd function like MultiThreadedQueue"
+    private static final class SchedulerWorkerQueueConditioner {
+        private int referenceCount = 0;
+        private boolean addBlocked = false;
+
+        private static final VarHandle REFERENCE_COUNT_HANDLE = ConcurrentUtil.getVarHandle(SchedulerWorkerQueueConditioner.class, "referenceCount", int.class);
+        private static final VarHandle BLOCK_ADD_HANDLE = ConcurrentUtil.getVarHandle(SchedulerWorkerQueueConditioner.class, "addBlocked", boolean.class);
+        
+        private boolean isAddBlocked() {
+            return (boolean) BLOCK_ADD_HANDLE.getVolatile(this);
+        }
+
+        private void blockAdd() {
+            BLOCK_ADD_HANDLE.setVolatile(this, true);
+        }
+
+        private void releaseWriteReference() {
+            if (!REFERENCE_COUNT_HANDLE.compareAndSet(this, -1, 0)) {
+                throw new IllegalStateException("Releasing when not write-locked");
+            }
+        }
+
+        private void acquireWriteReference() {
+            int failureCount = 0;
+            for (;;) {
+                for (int i = 0; i < failureCount; i++) {
+                    ConcurrentUtil.backoff();
+                }
+
+                final int curr = (int) REFERENCE_COUNT_HANDLE.getVolatile(this);
+
+                if (curr > 0 || curr == -1) {
+                    failureCount++;
+                    continue;
+                }
+
+                if (!REFERENCE_COUNT_HANDLE.compareAndSet(this, curr, -1)) {
+                    failureCount++;
+                    continue;
+                }
+
+                break;
+            }
+        }
+
+        private void releaseReadReference() {
+            int failureCount = 0;
+            for (;;) {
+                for (int i = 0; i < failureCount; i++) {
+                    ConcurrentUtil.backoff();
+                }
+
+                final int curr = (int) REFERENCE_COUNT_HANDLE.getVolatile(this);
+
+                if (curr == -1) {
+                    throw new IllegalStateException("Cannot release read reference when write locked");
+                }
+
+                if (curr == 0) {
+                    throw new IllegalStateException("Setting reference count down to a value lower than 0!");
+                }
+
+                if (!REFERENCE_COUNT_HANDLE.compareAndSet(this, curr, curr - 1)) {
+                    failureCount++;
+                    continue;
+                }
+
+                break;
+            }
+        }
+
+        private void acquireReadReference() {
+            int failureCount = 0;
+            for (;;) {
+                for (int i = 0; i < failureCount; i++) {
+                    ConcurrentUtil.backoff();
+                }
+
+                final int curr = (int) REFERENCE_COUNT_HANDLE.getVolatile(this);
+
+                if (curr == -1) {
+                    failureCount++;
+                    continue;
+                }
+
+                if (!REFERENCE_COUNT_HANDLE.compareAndSet(this, curr, curr + 1)) {
+                    failureCount++;
+                    continue;
+                }
+
+                break;
+            }
+        }
+    }
+
+    private final class SchedulerWorkerThreadCarrier implements Runnable {
+        private static final Comparator<WorkerMessageNode> TICK_COMPARATOR_BY_TIME = (t1, t2) -> {
+            int timeCompare = TimeUtil.compareTimes(t1.internal.scheduledStart, t2.internal.scheduledStart);
+            return timeCompare != 0 ? timeCompare : Long.compare(t1.internal.id, t2.internal.id);
+        };
+
         public static final int STATUS_IDLE = 0;
         public static final int STATUS_SHUTDOWN = 1;
         public static final int STATUS_BUSY = 2;
         public static final int STATUS_RUNNING = 3;
 
         private final Thread runner;
-        private final MultiThreadedQueue<WorkerMessageNode> inComingTaskMessages = new MultiThreadedQueue<>();
+        private final ConcurrentSkipListSet<WorkerMessageNode> inComingTaskMessages = new ConcurrentSkipListSet<>(TICK_COMPARATOR_BY_TIME);
+        private final SchedulerWorkerQueueConditioner queueConditioner = new SchedulerWorkerQueueConditioner();
 
         private final AtomicBoolean killSignal = new AtomicBoolean(false);
         private final AtomicInteger status = new AtomicInteger(0);
@@ -522,7 +629,7 @@ public class ActorSchedulerThreadPool {
         private final AtomicInteger validTaskExecutedCnt = new AtomicInteger(0);
         private final AtomicInteger loopedTimes = new AtomicInteger(0);
 
-        private WorkerThreadCarrier(@NotNull ThreadFactory factory) {
+        private SchedulerWorkerThreadCarrier(@NotNull ThreadFactory factory) {
             runner = factory.newThread(this);
         }
 
@@ -538,9 +645,9 @@ public class ActorSchedulerThreadPool {
                 this.loopedTimes.getAndIncrement();
 
                 final boolean killed = this.killSignal.get();
-                final WorkerMessageNode incomingMessage = this.takeMessage(killed);
+                WorkerMessageNode incomingMessage = this.takeMessage(killed);
 
-                // no more task stay in curr thread
+                // no more task stay in curr thread and we were killed
                 if (killed && incomingMessage == null) {
                     break;
                 }
@@ -567,6 +674,20 @@ public class ActorSchedulerThreadPool {
                         continue;
                     }
                     executeFailureCount++;
+                } else {
+                    // steal some task from other busy threads
+                    // here we won't increase the executeFailed cnt when steal failed as we are not running tasks of ourselves
+                    final SchedulerWorkerThreadCarrier other = ActorSchedulerThreadPool.this.selectWorker(false);
+
+                    incomingMessage = other != null ? other.setal() : null;
+
+                    if (incomingMessage != null) {
+                        // it is in our queue now
+                        incomingMessage.setWorker(this);
+
+                        this.inComingTaskMessages.add(incomingMessage);
+                        continue;
+                    }
                 }
 
                 this.status.set(STATUS_IDLE);
@@ -593,7 +714,13 @@ public class ActorSchedulerThreadPool {
         }
 
         private WorkerMessageNode takeMessage(boolean blockAdd) {
-            return blockAdd ? this.inComingTaskMessages.pollOrBlockAdds() : this.inComingTaskMessages.poll();
+            if (blockAdd) {
+                this.queueConditioner.acquireWriteReference();
+                this.queueConditioner.blockAdd();
+                this.queueConditioner.releaseWriteReference();
+            }
+
+            return this.inComingTaskMessages.pollFirst();
         }
 
         private void killSignal() {
@@ -602,8 +729,24 @@ public class ActorSchedulerThreadPool {
             }
         }
 
+        private WorkerMessageNode setal() {
+            return this.inComingTaskMessages.pollLast();
+        }
+
         private boolean message(WorkerMessageNode messageNode) {
-            final boolean queued = this.inComingTaskMessages.offer(messageNode);
+            if (this.killSignal.get()) {
+                return false;
+            }
+
+            boolean queued = false;
+
+            this.queueConditioner.acquireReadReference();
+
+            if (!this.queueConditioner.isAddBlocked()) {
+                queued = this.inComingTaskMessages.add(messageNode);
+            }
+
+            this.queueConditioner.releaseReadReference();
 
             if (queued) {
                 LockSupport.unpark(this.runner);
