@@ -252,7 +252,7 @@ public class ActorSchedulerThreadPool {
                 true // Interrupt tick once (we'll process the tick soon later)
         );
 
-        this.dispatchMessageNodeAuto(target, false);
+        this.dispatchMessageNodeAuto(target, true);
     }
 
     public void schedule(SchedulableTick task) {
