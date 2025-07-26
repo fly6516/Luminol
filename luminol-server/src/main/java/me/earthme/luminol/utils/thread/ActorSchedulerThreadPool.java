@@ -111,6 +111,11 @@ public class ActorSchedulerThreadPool {
                 final int totalThreads = this.workers.size();
 
                 double totalTaskHitPct = 0;
+
+                for (SchedulerWorkerThreadCarrier worker : this.workers) {
+                    totalTaskHitPct += (double) worker.validTaskExecutedCnt.get() / (double) worker.loopedTimes.get();
+                }
+
                 final double avgTaskHitPct = Math.min(totalTaskHitPct / totalThreads, 1.0D);
 
                 this.lastAvgHitPct = avgTaskHitPct;
