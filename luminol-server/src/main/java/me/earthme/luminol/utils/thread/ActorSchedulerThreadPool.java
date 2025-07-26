@@ -735,7 +735,7 @@ public class ActorSchedulerThreadPool {
         }
 
         private WorkerMessageNode setal() {
-            return this.inComingTaskMessages.pollLast();
+            return this.inComingTaskMessages.pollFirst();
         }
 
         private boolean message(WorkerMessageNode messageNode) {
